@@ -156,7 +156,7 @@ def fetch_fx(period):
     return yf.Ticker("KRW=X").history(period=period, auto_adjust=True)
 
 st.title("📊 Portfolio Risk Terminal")
-st.caption("iPad · Safari 최적화 / 한국·미국 주식 / Sharpe / Risk Parity / 상관계수 / MDD / VaR·CVaR")
+st.caption("iPad · Safari 최적화 / 수량을 바꾸면 비중 자동 재계산 / Sharpe / Risk Parity / 상관계수 / MDD / VaR·CVaR")
 
 with st.expander("⚙️ 분석 설정", expanded=False):
     c1, c2 = st.columns(2)
@@ -167,14 +167,24 @@ with st.expander("⚙️ 분석 설정", expanded=False):
     cov_window = c4.selectbox("Risk Parity 기간", [60, 120, 252], index=1)
     max_rp = st.slider("Risk Parity 종목당 최대 비중", .20, 1.0, .50, .05)
 
+weight_method = st.radio(
+    "비중 계산 방식",
+    ["실제 수량으로 자동 계산", "직접 비중 입력"],
+    index=0,
+    horizontal=True,
+    help="수량을 바꿀 때 비중도 자동으로 바뀌게 하려면 '실제 수량으로 자동 계산'을 선택하세요."
+)
+
 default = pd.DataFrame([
-    {"ticker":"005930.KS","name":"삼성전자","market":"KR","quantity":0.0,"override_weight":0.30},
-    {"ticker":"000660.KS","name":"SK하이닉스","market":"KR","quantity":0.0,"override_weight":0.20},
-    {"ticker":"NVDA","name":"NVIDIA","market":"US","quantity":0.0,"override_weight":0.20},
-    {"ticker":"BE","name":"Bloom Energy","market":"US","quantity":0.0,"override_weight":0.15},
-    {"ticker":"BWXT","name":"BWX Technologies","market":"US","quantity":0.0,"override_weight":0.05},
-    {"ticker":"CASH_KRW","name":"현금","market":"CASH","quantity":0.0,"override_weight":0.10},
+    {"ticker":"005930.KS","name":"삼성전자","market":"KR","quantity":150.0,"override_weight":0.00},
+    {"ticker":"000660.KS","name":"SK하이닉스","market":"KR","quantity":40.0,"override_weight":0.00},
+    {"ticker":"OII","name":"OII","market":"US","quantity":84.0,"override_weight":0.00},
+    {"ticker":"SOXL","name":"SOXL","market":"US","quantity":58.0,"override_weight":0.00},
+    {"ticker":"CASH_KRW","name":"현금","market":"CASH","quantity":0.0,"override_weight":0.00},
 ])
+
+if "portfolio_data" not in st.session_state:
+    st.session_state.portfolio_data = default.copy()
 
 uploaded = st.file_uploader("포트폴리오 CSV 불러오기", type=["csv"])
 if uploaded is not None:
@@ -184,26 +194,29 @@ if uploaded is not None:
         if not need.issubset(tmp.columns):
             st.error("CSV 컬럼: ticker, name, market, quantity, override_weight 가 필요합니다.")
         else:
-            default = tmp
+            st.session_state.portfolio_data = tmp.copy()
     except Exception as e:
         st.error(f"CSV 읽기 실패: {e}")
 
 with st.expander("✏️ 보유종목 편집", expanded=True):
     edited = st.data_editor(
-        default,
+        st.session_state.portfolio_data,
         num_rows="dynamic",
         use_container_width=True,
+        key="portfolio_editor",
         column_config={
             "ticker": st.column_config.TextColumn("Ticker", help="한국: 005930.KS / 미국: NVDA"),
             "name": st.column_config.TextColumn("종목명"),
             "market": st.column_config.SelectboxColumn("시장", options=["KR","US","CASH"]),
             "quantity": st.column_config.NumberColumn("수량/현금액", min_value=0.0, format="%.4f"),
             "override_weight": st.column_config.NumberColumn(
-                "직접 비중", min_value=0.0, max_value=1.0, step=.01,
-                help="직접 비중이 하나라도 있으면 이 비중을 사용합니다. 실제 수량 기반 자동계산을 쓰려면 전부 비우세요."
+                "직접 비중 (0~1)", min_value=0.0, max_value=1.0, step=.01,
+                help="'직접 비중 입력' 모드에서만 사용합니다. 예: 30%는 0.30"
             ),
         },
     )
+    st.session_state.portfolio_data = edited.copy()
+
     st.download_button(
         "현재 포트폴리오 CSV 저장",
         edited.to_csv(index=False).encode("utf-8-sig"),
@@ -213,9 +226,18 @@ with st.expander("✏️ 보유종목 편집", expanded=True):
     )
 
 df = edited.copy()
-df["ticker"] = df["ticker"].astype(str).str.strip()
-df["market"] = df["market"].astype(str).str.upper().str.strip()
-df = df[df["ticker"] != ""]
+
+# 빈 행/None/NaN을 안전하게 처리
+for col in ["ticker", "name", "market"]:
+    df[col] = df[col].fillna("").astype(str).str.strip()
+
+df["ticker"] = df["ticker"].str.upper()
+df["market"] = df["market"].str.upper()
+df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0.0)
+df["override_weight"] = pd.to_numeric(df["override_weight"], errors="coerce").fillna(0.0)
+
+# 완전히 빈 편집 행이나 시장 미선택 행은 분석에서 제외
+df = df[(df["ticker"] != "") & (df["market"].isin(["KR", "US", "CASH"]))].copy()
 
 non_cash = df[df["market"] != "CASH"].copy()
 if non_cash.empty:
@@ -268,35 +290,36 @@ R = pd.concat(returns.values(), axis=1).dropna(how="all")
 R.columns = list(returns.keys())
 
 # Current weights
-ow = pd.to_numeric(df["override_weight"], errors="coerce")
-use_override = (ow.fillna(0) > 0).any()
-
-if use_override:
-    raw = ow.fillna(0).to_numpy(dtype=float)
+if weight_method == "직접 비중 입력":
+    raw = df["override_weight"].fillna(0).to_numpy(dtype=float)
+    if raw.sum() <= 0:
+        st.error("직접 비중 입력 모드에서는 비중을 입력해 주세요. 예: 30% = 0.30")
+        st.stop()
     df["current_weight"] = normalize(raw)
     df["market_value_krw"] = np.nan
     weight_mode = "직접 비중"
 else:
+    # 실제 보유 수량 × 현재가로 평가금액을 계산해 비중을 자동 산출
     vals = []
     for _, row in df.iterrows():
-        qty = float(pd.to_numeric(row["quantity"], errors="coerce") or 0)
+        qty = float(row["quantity"])
         if row["market"] == "CASH":
             val = qty
         else:
             px = prices.get(row["ticker"], np.nan)
             if pd.isna(px):
-                val = np.nan
+                val = 0.0
             elif row["market"] == "US":
                 val = qty * px * latest_fx
             else:
                 val = qty * px
         vals.append(val)
     df["market_value_krw"] = vals
-    total = df["market_value_krw"].fillna(0).sum()
+    total = df["market_value_krw"].sum()
     if total <= 0:
         st.error("수량 기반 계산을 사용하려면 보유수량 또는 현금액을 입력하세요.")
         st.stop()
-    df["current_weight"] = df["market_value_krw"].fillna(0) / total
+    df["current_weight"] = df["market_value_krw"] / total
     weight_mode = "실제 수량"
 
 risky = df[(df["market"] != "CASH") & (df["ticker"].isin(R.columns))].copy()
